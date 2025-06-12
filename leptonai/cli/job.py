@@ -1,3 +1,4 @@
+from typing import List, Optional
 import click
 from datetime import datetime
 import json
@@ -27,6 +28,124 @@ from leptonai.api.v1.types.job import (
 )
 from leptonai.api.v1.types.deployment import ContainerPort, LeptonLog, QueueConfig
 from leptonai.api.v2.client import APIClient
+
+
+def _display_jobs_table(jobs: List[LeptonJob]):
+    table = Table(show_header=True, show_lines=True)
+    table.add_column("Name")
+    table.add_column("ID")
+    table.add_column("CreatedAt")
+    table.add_column("State")
+    table.add_column("Owner")
+    table.add_column("NodeGroup")
+
+    for job in jobs:
+        ng_str = (
+            "\n".join(job.spec.affinity.allowed_dedicated_node_groups).lower()
+            if job.spec.affinity and job.spec.affinity.allowed_dedicated_node_groups
+            else ""
+        )
+        status = job.status
+        table.add_row(
+            job.metadata.name,
+            job.metadata.id_,
+            (
+                datetime.fromtimestamp(job.metadata.created_at / 1000).strftime(
+                    "%Y-%m-%d\n%H:%M:%S"
+                )
+                if job.metadata.created_at
+                else "N/A"
+            ),
+            f"{status.state}",
+            job.metadata.owner,
+            ng_str,
+        )
+    table.title = "Jobs"
+    console.print(table)
+
+
+def _filter_jobs(
+    jobs: List[LeptonJob],
+    state: Optional[List[str]] = None,
+    user_patterns: Optional[List[str]] = None,
+    name_patterns: Optional[List[str]] = None,
+    node_group_patterns: Optional[List[str]] = None,
+    exact_users: Optional[List[str]] = None,
+    exact_names: Optional[List[str]] = None,
+) -> List[LeptonJob]:
+    """
+    Filter jobs by various criteria.
+    Pattern matching (state, user_pattern, name_pattern, node_group_pattern) is case-insensitive and matches the beginning.
+    Exact matching (exact_user, exact_name) is case-sensitive and requires full match.
+
+    Args:
+        jobs: List of jobs to filter
+        state: Optional list of states to filter by (pattern match)
+        user_pattern: Optional list of user patterns to filter by (pattern match)
+        name_pattern: Optional list of name patterns to filter by (pattern match)
+        node_group_pattern: Optional list of node group patterns to filter by (pattern match)
+        exact_user: Optional list of exact usernames to filter by (exact match)
+        exact_name: Optional list of exact names to filter by (exact match)
+
+    Returns:
+        Filtered list of jobs
+    """
+    # If no filters are specified, return the original list
+    if not any([
+        state,
+        user_patterns,
+        name_patterns,
+        node_group_patterns,
+        exact_users,
+        exact_names,
+    ]):
+        return jobs
+
+    filtered_jobs = []
+    for job in jobs:
+        # Skip if state filter is specified and job state doesn't match any of the states
+        if state and not any(
+            job.status.state.lower().startswith(s.lower()) for s in state
+        ):
+            continue
+
+        # Skip if user pattern filter is specified and job owner doesn't match any of the patterns
+        if user_patterns and not any(
+            job.metadata.owner.lower().startswith(u.lower()) for u in user_patterns
+        ):
+            continue
+
+        # Skip if name pattern filter is specified and job name doesn't match any of the patterns
+        if name_patterns and not any(
+            n.lower() in job.metadata.name.lower() for n in name_patterns
+        ):
+            continue
+
+        # Skip if exact user filter is specified and job owner doesn't match exactly
+        if exact_users and job.metadata.owner not in exact_users:
+            continue
+
+        # Skip if exact name filter is specified and job name doesn't match exactly
+        if exact_names and job.metadata.name not in exact_names:
+            continue
+
+        # Skip if node group pattern filter is specified and job node group doesn't match any of the patterns
+        if node_group_patterns:
+            node_groups = (
+                job.spec.affinity.allowed_dedicated_node_groups
+                if job.spec.affinity
+                else None
+            )
+            if not node_groups or not any(
+                pattern.lower() in ng.lower()
+                for pattern in node_group_patterns
+                for ng in node_groups
+            ):
+                continue
+
+        filtered_jobs.append(job)
+
+    return filtered_jobs
 
 
 def _get_newest_job_by_name(job_name: str) -> LeptonJob:
@@ -417,7 +536,7 @@ def create(
         available_types = "\n      ".join(VALID_SHAPES)
         console.print(
             "[red]Error: Missing option '--resource-shape'.[/] "
-            f"Available types are:\n      {available_types}. \n"
+            f"Available types are:\n      {available_types} \n"
         )
         sys.exit(1)
 
@@ -510,35 +629,264 @@ def create(
 
 
 @job.command(name="list")
-def list_command():
+@click.option(
+    "--state",
+    "-s",
+    help=(
+        "Filter jobs by state. Case-insensitive and matches the beginning of the state"
+        " name. Available states: Starting, Running, Failed, Completed, Stopped,"
+        " Stopping, Deleting, Deleted, Restarting, Archived, Queueing, Awaiting,"
+        " PendingRetry. Example: 'run' will match 'Running'. Can specify multiple"
+        " states."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--user",
+    "-u",
+    help=(
+        "Filter jobs by user. Case-insensitive and matches the beginning of the"
+        " username. Can specify multiple users. Example: 'alice' will match 'alice123'"
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--name-or-id",
+    "-n",
+    help=(
+        "Filter jobs by name or id. Case-insensitive and matches any part of the name"
+        " or id. Can specify multiple names or ids. Example: 'train' will match"
+        " 'training-job-123'"
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--node-group",
+    "-ng",
+    help=(
+        "Filter jobs by node group. Case-insensitive and matches any part of the node"
+        " group name."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+def list_command(state, user, name_or_id, node_group):
     """
     Lists all jobs in the current workspace.
+
+    You can filter jobs by:
+    - State: Case-insensitive prefix match (e.g., 'run' matches 'Running')
+    - User: Case-insensitive prefix match (e.g., 'alice' matches 'alice123')
+    - Name/ID: Case-insensitive substring match (e.g., 'train' matches 'training-job-123')
+    - Node Group: Case-insensitive substring match
+
+    Multiple filters can be combined. For example:
+    lep job list -s queue -u alice -n train -ng h100
     """
     client = APIClient()
     jobs = client.job.list_all()
     logger.trace(f"Jobs: {jobs}")
 
-    table = Table(show_header=True)
-    table.add_column("Name")
-    table.add_column("ID")
-    table.add_column("Created At")
-    table.add_column("State (ready,active,succeeded,failed)")
-    for job in jobs:
-        status = job.status
-        table.add_row(
-            job.metadata.name,
-            job.metadata.id_,
-            (
-                datetime.fromtimestamp(job.metadata.created_at / 1000).strftime(
-                    "%Y-%m-%d\n%H:%M:%S"
-                )
-                if job.metadata.created_at
-                else "N/A"
-            ),
-            f"{status.state} ({status.ready},{status.active},{status.succeeded},{status.failed})",
-        )
-    table.title = "Jobs"
-    console.print(table)
+    job_filtered = _filter_jobs(
+        jobs,
+        state,
+        user_patterns=user,
+        name_patterns=name_or_id,
+        node_group_patterns=node_group,
+    )
+
+    _display_jobs_table(job_filtered)
+
+
+@job.command()
+@click.option(
+    "--state",
+    "-s",
+    help=(
+        "Filter jobs by state. Case-insensitive and matches the beginning of the state"
+        " name. Available states: Starting, Running, Failed, Completed, Stopped,"
+        " Stopping, Deleting, Deleted, Restarting, Archived, Queueing, Awaiting,"
+        " PendingRetry. Example: 'run' will match 'Running'. Can specify multiple"
+        " states."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--user",
+    "-u",
+    help=(
+        "Filter jobs by exact username match. Case-sensitive. "
+        "Can specify multiple users. For safety, this is an exact match. "
+        "This option is required to prevent accidental operations on other users' jobs."
+    ),
+    type=str,
+    required=True,
+    multiple=True,
+)
+@click.option(
+    "--name",
+    "-n",
+    help=(
+        "Filter jobs by exact name match. Case-sensitive. "
+        "Can specify multiple names. For safety, this is an exact match."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--node-group",
+    "-ng",
+    help=(
+        "Filter jobs by node group. Case-insensitive and matches any part of the node"
+        " group name."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+def remove_all(state, user, name, node_group):
+    """
+    Removes all jobs matching the specified filters. At least one filter must be provided.
+    For safety, name and user filters require exact matches. State filter remains flexible.
+    The --user option is required to prevent accidental operations on other users' jobs.
+    """
+    if not state and not user and not name and not node_group:
+        console.print("[red]Error[/]: You must provide at least one filter.")
+        sys.exit(1)
+
+    client = APIClient()
+    jobs = client.job.list_all()
+    job_filtered = _filter_jobs(
+        jobs, state, node_group_patterns=node_group, exact_users=user, exact_names=name
+    )
+
+    _display_jobs_table(job_filtered)
+
+    user_set = set(job.metadata.owner for job in job_filtered)
+
+    console.print(f"Total [red]{len(job_filtered)}[/] jobs to delete.")
+    console.print(
+        f"These jobs belong to [green]{len(user_set)}[/] user(s):"
+        f" [green]{', '.join(user_set)}[/]"
+    )
+
+    console.print("To confirm deletion, please enter the number of jobs to delete:")
+    try:
+        confirm_count = int(click.prompt("Number of jobs to delete", type=int))
+        if confirm_count != len(job_filtered):
+            console.print(
+                f"[red]Error[/]: Number mismatch. Expected {len(job_filtered)} jobs."
+            )
+            sys.exit(1)
+    except ValueError:
+        console.print("[red]Error[/]: Please enter a valid number.")
+        sys.exit(1)
+
+    for job in job_filtered:
+        client.job.delete(job.metadata.id_)
+        console.print(f"Job [green]{job.metadata.id_}[/] deleted successfully.")
+
+
+@job.command()
+@click.option(
+    "--state",
+    "-s",
+    help=(
+        "Filter jobs by state. Case-insensitive and matches the beginning of the state"
+        " name. Available states: Starting, Running, Failed, Completed, Stopped,"
+        " Stopping, Deleting, Deleted, Restarting, Archived, Queueing, Awaiting,"
+        " PendingRetry. Example: 'run' will match 'Running'. Can specify multiple"
+        " states."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--user",
+    "-u",
+    help=(
+        "Filter jobs by exact username match. Case-sensitive. "
+        "Can specify multiple users. For safety, this is an exact match. "
+        "This option is required to prevent accidental operations on other users' jobs."
+    ),
+    type=str,
+    required=True,
+    multiple=True,
+)
+@click.option(
+    "--name",
+    "-n",
+    help=(
+        "Filter jobs by exact name match. Case-sensitive. "
+        "Can specify multiple names. For safety, this is an exact match."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+@click.option(
+    "--node-group",
+    "-ng",
+    help=(
+        "Filter jobs by node group. Case-insensitive and matches any part of the node"
+        " group name."
+    ),
+    type=str,
+    required=False,
+    multiple=True,
+)
+def stop_all(state, user, name, node_group):
+    """
+    Stop all jobs matching the specified filters. At least one filter must be provided.
+    For safety, name and user filters require exact matches. State filter remains flexible.
+    The --user option is required to prevent accidental operations on other users' jobs.
+    """
+    if not state and not user and not name and not node_group:
+        console.print("[red]Error[/]: You must provide at least one filter.")
+        sys.exit(1)
+
+    client = APIClient()
+    jobs = client.job.list_all()
+    job_filtered = _filter_jobs(
+        jobs, state, node_group_patterns=node_group, exact_users=user, exact_names=name
+    )
+
+    _display_jobs_table(job_filtered)
+
+    user_set = set(job.metadata.owner for job in job_filtered)
+
+    console.print(f"Total [red]{len(job_filtered)}[/] jobs to stop.")
+    console.print(
+        f"These jobs belong to [green]{len(user_set)}[/] user(s):"
+        f" [green]{', '.join(user_set)}[/]"
+    )
+
+    console.print("To confirm stop, please enter the number of jobs to stop:")
+    try:
+        confirm_count = int(click.prompt("Number of jobs to stop", type=int))
+        if confirm_count != len(job_filtered):
+            console.print(
+                f"[red]Error[/]: Number mismatch. Expected {len(job_filtered)} jobs."
+            )
+            sys.exit(1)
+    except ValueError:
+        console.print("[red]Error[/]: Please enter a valid number.")
+        sys.exit(1)
+
+    for job in job_filtered:
+        client.job.update(job.metadata.id_, spec={"spec": {"stopped": True}})
+        console.print(f"Job [green]{job.metadata.id_}[/] stopped successfully.")
 
 
 @job.command()
@@ -546,7 +894,15 @@ def list_command():
 @click.option("--id", "-i", help="Job id", type=str, required=False)
 def get(name, id):
     """
-    Gets the job with the given name.
+    Gets detailed information about jobs.
+
+    You can search by either name or id:
+    - If searching by name, returns all jobs with that exact name
+    - If searching by id, returns the specific job with that id
+
+    Args:
+        name: Job name to search for (exact match)
+        id: Job id to search for (exact match)
     """
     if not name and not id:
         raise click.UsageError("You must provide either --name or --id.")
@@ -567,6 +923,11 @@ def get(name, id):
         for job in jobs:
             if job.metadata.name == name:
                 target_jobs.append(job)
+
+    if len(target_jobs) == 0:
+        search_type = "Name" if name else "ID"
+        console.print(f"No job found for [red]{search_type}: {name or id}[/].")
+        sys.exit(1)
 
     console.print(f"Job details for [green]{name or id}[/]:")
     for job in target_jobs:
@@ -589,7 +950,17 @@ def get(name, id):
 )
 def remove(id, name):
     """
-    Removes the job with the given name.
+    Removes a single job.
+
+    You can remove a job by either name or id:
+    - If removing by name, only the newest job with that exact name will be removed
+    - If removing by id, the specific job with that id will be removed
+
+    For removing multiple jobs with the same name, use 'lep job remove-all' instead.
+
+    Args:
+        id: Job id to remove (exact match)
+        name: Job name to remove (exact match, removes only the newest matching job)
     """
     if not name and not id:
         raise click.UsageError("You must provide either --name or --id.")
@@ -605,14 +976,48 @@ def remove(id, name):
         target_job_ids.append(id)
 
     if name:
-        jobs = client.job.list_all()
-        for job in jobs:
-            if job.metadata.name == name:
-                target_job_ids.append(job.metadata.id_)
+        job = _get_newest_job_by_name(name)
+        if job:
+            target_job_ids.append(job.metadata.id_)
+        else:
+            console.print(f"No job found with name [red]{name}[/].")
+            sys.exit(1)
 
     for job_id in target_job_ids:
         client.job.delete(job_id)
         console.print(f"Job [green]{job_id}[/] deleted successfully.")
+
+
+@job.command()
+@click.option("--id", "-i", help="The job id to get events.", required=True)
+def clone(id):
+    """
+    Creates a copy of an existing job by its ID.
+
+    The cloned job will:
+    - Have the same configuration as the original job
+    - Have a new name with '-clone' suffix
+
+    Args:
+        id: ID of the job to clone
+    """
+    client = APIClient()
+    job = client.job.get(id)
+    job_spec = job.spec
+
+    visibility = job.metadata.visibility
+    name = job.metadata.name[:26] + "-clone"
+
+    job = LeptonJob(
+        spec=job_spec,
+        metadata=Metadata(
+            id=name,
+            visibility=LeptonVisibility(visibility) if visibility else None,
+        ),
+    )
+
+    new_job = client.job.create(job)
+    console.print(f"Job [green]{new_job.metadata.id_}[/] cloned successfully.")
 
 
 @job.command()
@@ -659,23 +1064,54 @@ def log(id, replica):
 @job.command()
 @click.option("--id", "-i", help="The job id to get replicas.", required=True)
 def replicas(id):
-
+    """
+    Prints the replicas id of a job.
+    """
     client = APIClient()
 
     replicas = client.job.get_replicas(id)
 
     table = Table(show_header=True, show_lines=False)
-    table.add_column("job name")
-    table.add_column("replica id")
+    table.add_column("Job Name")
+    table.add_column("Replica ID")
+    table.add_column("Node ID")
 
     for replica in replicas:
-        table.add_row(id, replica.metadata.id_)
+        node_id = None
+        if replica.status and replica.status.node:
+            node_id = replica.status.node.id_
+        table.add_row(id, replica.metadata.id_, node_id)
     console.print(table)
+
+
+@job.command()
+@click.option("--id", "-i", help="The job id to get replicas.", required=True)
+def nodes(id):
+    """
+    Prints the nodes id of a job.
+    """
+    client = APIClient()
+
+    replicas = client.job.get_replicas(id)
+    node_list = []
+    for replica in replicas:
+        if replica.status and replica.status.node:
+            node_list.append(replica.status.node.id_)
+    node_list = sorted(node_list)
+
+    console.print("\n[bold blue]Job Nodes:[/] \n")
+    console.print("[green]" + json.dumps(node_list, indent=2) + "[/]\n")
 
 
 @job.command()
 @click.option("--id", "-i", help="The job id to stop.", required=True)
 def stop(id):
+    """
+    Stops a job by its ID.
+
+    Args:
+        id: ID of the job to stop
+    """
     client = APIClient()
     cur_job = client.job.get(id)
     if cur_job.spec.stopped is True:
@@ -691,6 +1127,12 @@ def stop(id):
 @job.command()
 @click.option("--id", "-i", help="The job id to start.", required=True)
 def start(id):
+    """
+    Starts a job by its ID.
+
+    Args:
+        id: ID of the job to start
+    """
     client = APIClient()
     cur_job = client.job.get(id)
     if (
@@ -710,7 +1152,12 @@ def start(id):
 @job.command()
 @click.option("--id", "-i", help="The job id to get events.", required=True)
 def events(id, replica=None):
+    """
+    Prints the events of a job by its ID.
 
+    Args:
+        id: ID of the job to get events
+    """
     client = APIClient()
 
     events = client.job.get_events(id)
